@@ -83,6 +83,10 @@ python -m src.control.controller
 ### 5. Access Dashboard
 Open your web browser and go to:
 [http://localhost:5000](http://localhost:5000)
+
+Live Dashboard on:
+[http://157.173.101.159:9369](http://157.173.101.159:9369/)
+
 *   View system status (Locked Target, Servo Action).
 *   See real-time logs of actions (Blink, Smile).
 
