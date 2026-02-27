@@ -3,8 +3,8 @@
 #include <Servo.h>
 
 // --- Configuration ---
-const char* ssid = "RCA";
-const char* password = "@RcaNyabihu2023";
+const char* ssid = "Main Hall";
+const char* password = "Meeting@2024";
 const char* mqtt_server = "157.173.101.159"; 
 
 const int mqtt_port = 1883;
@@ -16,7 +16,8 @@ const char* topic_heartbeat = "y3d/team7/heartbeat";
 Servo myServo;
 const int servoPin = 14; // GPIO14 is D5 on NodeMCU
 int currentAngle = 90;   
-const int moveStep = 100; // Step size as requested
+const int moveStep = 30; // Step size as requested
+int searchDirection = 1; // Used to track direction during continuous search
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -47,9 +48,15 @@ void setup_wifi() {
 void moveServo(int delta) {
   currentAngle += delta;
   
-  // Constrain to physical servo limits (0-180)
-  if (currentAngle < 0) currentAngle = 0;
-  if (currentAngle > 180) currentAngle = 180;
+  // Constrain to physical servo limits (0-180) and reverse search direction if searching
+  if (currentAngle <= 0) {
+    currentAngle = 0;
+    searchDirection = 1;
+  }
+  if (currentAngle >= 180) {
+    currentAngle = 180;
+    searchDirection = -1;
+  }
   
   myServo.write(currentAngle);
   Serial.print("Moving by: "); Serial.print(delta);
@@ -67,8 +74,13 @@ void callback(char* topic, byte* payload, unsigned int length) {
   Serial.print("] ");
   Serial.println(message);
 
-  // Fix: use >= 0 so it detects commands even at the start of the string
-  if (message.indexOf("MOVE_LEFT") >= 0) {
+  // Execute control commands
+  if (message.startsWith("STEP:")) {
+    int step = message.substring(5).toInt();
+    moveServo(step);
+  } else if (message.startsWith("SEARCH")) {
+    moveServo(2 * searchDirection); // Continuously pan to find face
+  } else if (message.indexOf("MOVE_LEFT") >= 0) {
     moveServo(moveStep); 
   } else if (message.indexOf("MOVE_RIGHT") >= 0) {
     moveServo(-moveStep);
@@ -112,36 +124,34 @@ void setup() {
 }
 
 void loop() {
-  // GATEKEEPER: Do nothing if WiFi is lost
+  // 1. Always keep the MQTT client processing
+  client.loop(); 
+
+  // 2. Handle WiFi Reconnection
   if (WiFi.status() != WL_CONNECTED) {
     static unsigned long lastWifiRetry = 0;
     if (millis() - lastWifiRetry > 5000) {
-      Serial.println("WiFi connection lost. Reconnecting...");
       WiFi.begin(ssid, password);
       lastWifiRetry = millis();
     }
     return; 
   }
 
-  // Handle MQTT Connection
+  // 3. Handle MQTT Reconnection (Non-blocking)
   if (!client.connected()) {
     static unsigned long lastMqttRetry = 0;
     if (millis() - lastMqttRetry > 5000) {
       reconnect();
       lastMqttRetry = millis();
     }
-  } else {
-    client.loop();
   }
 
-  // Heartbeat every 5 seconds
+  // 4. Heartbeat logic
   static unsigned long lastMsg = 0;
-  unsigned long now = millis();
-  if (now - lastMsg > 5000) {
-    lastMsg = now;
+  if (millis() - lastMsg > 5000) {
+    lastMsg = millis();
     if (client.connected()) {
-      String heartbeat = "{\"node\": \"esp8266\", \"status\": \"ONLINE\"}";
-      client.publish(topic_heartbeat, heartbeat.c_str());
+      client.publish(topic_heartbeat, "{\"status\": \"ONLINE\"}");
     }
   }
 }

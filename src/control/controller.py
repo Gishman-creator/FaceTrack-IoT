@@ -100,6 +100,7 @@ def cv_loop(initial_target):
     t0 = time.time()
     frames = 0
     fps = 0.0
+    last_servo_time = 0.0
 
     while True:
         ret, frame = cap.read()
@@ -199,26 +200,35 @@ def cv_loop(initial_target):
         # Logic
         action_status = "Idle"
         is_locked = False
+        now = time.time()
         
         if best_match:
             is_locked = True
             face = best_match
             cx = (face.x1 + face.x2) / 2
             
-            # Servo Control Logic (Simple Proportional / Threshold)
-            # Deadzone of 50px
+            # Servo Control Logic (Proportional & Rate Limited)
             err = cx - center_x_frame
-            if err < -50: # Face is to the LEFT of center
-                publish_move("MOVE_LEFT") # Move camera LEFT to center it?
-                # Actually, if face is LEFT (pixel < center), we need to pan servo LEFT (increase/decrease angle depends on mount).
-                # Assuming standard: Left side of image = Left side of world. Servo needs to turn Left.
-                action_status = "Moving Left"
-            elif err > 50: # Face is to the RIGHT
-                publish_move("MOVE_RIGHT")
-                action_status = "Moving Right"
+            # Deadzone of 40px to avoid jitter when face is relatively centered
+            if abs(err) > 40:
+                if now - last_servo_time > 0.05: # Max 20Hz update rate
+                    # Proportional step based on error distance
+                    # Inverted step calculation so it moves towards the face
+                    # depending on the servo mounting orientation.
+                    step = int(-err / 25)
+                    
+                    # Ensure minimal movement happens if outside deadzone
+                    if step == 0:
+                        step = 1 if -err > 0 else -1
+                        
+                    # Constrain max step size per update to prevent sudden jerking
+                    step = max(-10, min(10, step))
+                    
+                    publish_move(f"STEP:{step}")
+                    last_servo_time = now
+                    action_status = f"Centering ({step} deg)"
             else:
-                 pass # Centered
-                 # publish_move("CENTERED") # Optional
+                 action_status = "Tracking (Centered)"
             
             # Action Detection (Blink/Smile)
             # We need to run FaceMesh on the full frame or ROI for actions
@@ -237,7 +247,11 @@ def cv_loop(initial_target):
             prev_cx = cx
             socketio.emit('status_update', {'locked': True, 'target': target_identity, 'action': action_status})
         else:
-             socketio.emit('status_update', {'locked': False, 'target': target_identity, 'action': "Searching"})
+             if now - last_servo_time > 0.05:
+                 publish_move("SEARCH")
+                 last_servo_time = now
+             action_status = "Searching"
+             socketio.emit('status_update', {'locked': False, 'target': target_identity, 'action': action_status})
 
         # Update Video Stream
         # ret, buffer = cv2.imencode('.jpg', vis)
