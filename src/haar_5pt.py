@@ -18,6 +18,7 @@ from typing import Optional, Tuple, List
 
 import cv2
 import numpy as np
+from . import config
 
 try:
     import mediapipe as mp
@@ -158,7 +159,8 @@ def _kps_span_ok(kps: np.ndarray, min_eye_dist: float = 12.0) -> bool:
     if eye_dist < min_eye_dist:
         return False
 
-    if not (lm[1] > no[1] and rm[1] > no[1]):
+    # Ensure eyes are above mouth corners (more robust than checking if nose is above mouth under rotation/tilt)
+    if not (le[1] < lm[1] and re[1] < rm[1]):
         return False
 
     return True
@@ -260,47 +262,45 @@ class Haar5ptDetector:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
         faces = self._haar_faces(gray)
-        if faces.shape[0] == 0:
-            return []
-
-        areas = faces[:, 2] * faces[:, 3]
-        i = int(np.argmax(areas))
-        x, y, w, h = faces[i].tolist()
-
         kps = self._facemesh_5pt(frame_bgr)
-        if kps is None:
-            if self.debug:
-                print("[haar_5pt] Haar face found but FaceMesh returned none -> reject")
-            return []
 
-        margin = 0.35
-        x1m = x - margin * w
-        y1m = y - margin * h
-        x2m = x + (1.0 + margin) * w
-        y2m = y + (1.0 + margin) * h
+        if faces.shape[0] == 0:
+            # Fallback to FaceMesh directly if Haar fails
+            if kps is None:
+                return []
+            if not _kps_span_ok(kps, min_eye_dist=10.0):
+                return []
+            box = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
+        else:
+            # Haar found face
+            if kps is None:
+                return []
+            
+            x, y, w, h = faces[0].tolist()
+            margin = 0.45  # Increased margin to accommodate head turns/tilts
+            x1m = x - margin * w
+            y1m = y - margin * h
+            x2m = x + (1.0 + margin) * w
+            y2m = y + (1.0 + margin) * h
 
-        inside = (
-            (kps[:, 0] >= x1m)
-            & (kps[:, 0] <= x2m)
-            & (kps[:, 1] >= y1m)
-            & (kps[:, 1] <= y2m)
-        )
+            inside = (
+                (kps[:, 0] >= x1m)
+                & (kps[:, 0] <= x2m)
+                & (kps[:, 1] >= y1m)
+                & (kps[:, 1] <= y2m)
+            )
 
-        if inside.mean() < 0.60:
-            if self.debug:
-                print(
-                    "[haar_5pt] FaceMesh points not consistent with Haar box -> reject"
-                )
-            return []
+            # If FaceMesh is outside the Haar box, we still trust FaceMesh if it passes the span validation
+            if inside.mean() < 0.40:
+                if not _kps_span_ok(kps, min_eye_dist=10.0):
+                    return []
+            else:
+                if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.15 * w)):
+                    return []
+                    
+            box = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
 
-        if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.18 * w)):
-            if self.debug:
-                print("[haar_5pt] 5pt geometry sanity failed -> reject")
-            return []
-
-        box = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
         box = _clip_box_xyxy(box, W, H)
-
         box_s = _ema(self._prev_box, box, self.smooth_alpha)
         kps_s = _ema(self._prev_kps, kps, self.smooth_alpha)
 
@@ -326,7 +326,7 @@ class Haar5ptDetector:
 # Demo
 # -------------------------
 def main():
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(config.CAMERA_INDEX)
 
     det = Haar5ptDetector(
         min_size=(70, 70),
@@ -404,7 +404,7 @@ class HaarFaceMesh5pt:
             )
         self.mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
-            max_num_faces=1,
+            max_num_faces=5,
             refine_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
@@ -458,15 +458,59 @@ class HaarFaceMesh5pt:
         H, W = frame_bgr.shape[:2]
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         faces = self._haar_faces(gray)
+        
+        out: List[FaceKpsBox] = []
+        
         if faces.shape[0] == 0:
-            return []
+            # Fallback: Run FaceMesh on the full frame directly if Haar fails
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            res = self.mesh.process(rgb)
+            if res.multi_face_landmarks:
+                for lm_obj in res.multi_face_landmarks[:max_faces]:
+                    lm = lm_obj.landmark
+                    idxs = [
+                        self.IDX_LEFT_EYE,
+                        self.IDX_RIGHT_EYE,
+                        self.IDX_NOSE_TIP,
+                        self.IDX_MOUTH_LEFT,
+                        self.IDX_MOUTH_RIGHT,
+                    ]
+                    pts = []
+                    for idx in idxs:
+                        p = lm[idx]
+                        pts.append([p.x * W, p.y * H])
+                    kps = np.array(pts, dtype=np.float32)
+                    
+                    if kps[0, 0] > kps[1, 0]:
+                        kps[[0, 1]] = kps[[1, 0]]
+                    if kps[3, 0] > kps[4, 0]:
+                        kps[[3, 4]] = kps[[4, 3]]
+                        
+                    if not _kps_span_ok(kps, min_eye_dist=10.0):
+                        continue
+                        
+                    bb = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
+                    bb[0] = max(0, min(W - 1, bb[0]))
+                    bb[1] = max(0, min(H - 1, bb[1]))
+                    bb[2] = max(0, min(W - 1, bb[2]))
+                    bb[3] = max(0, min(H - 1, bb[3]))
+                    
+                    out.append(
+                        FaceKpsBox(
+                            x1=int(bb[0]),
+                            y1=int(bb[1]),
+                            x2=int(bb[2]),
+                            y2=int(bb[3]),
+                            score=1.0,
+                            kps=kps.astype(np.float32),
+                        )
+                    )
+            return out
         
         # Sort by area
         areas = faces[:, 2] * faces[:, 3]
         order = np.argsort(areas)[::-1]
         faces = faces[order][:max_faces]
-        
-        out: List[FaceKpsBox] = []
         
         for x, y, w, h in faces:
             mx, my = 0.25 * w, 0.35 * h
@@ -486,7 +530,7 @@ class HaarFaceMesh5pt:
             kps[:, 0] += float(rx1)
             kps[:, 1] += float(ry1)
             
-            if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.18 * float(w))):
+            if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.15 * float(w))):
                 continue
                 
             bb = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)

@@ -34,6 +34,7 @@ except Exception as e:
     mp = None
     _MP_IMPORT_ERROR = e
 
+from . import config
 from .haar_5pt import align_face_5pt
 
 
@@ -114,14 +115,14 @@ def _kps_span_ok(kps: np.ndarray, min_eye_dist: float) -> bool:
     """
     Minimal geometry sanity:
     - eyes not collapsed
-    - mouth generally below nose
+    - mouth generally below eyes (more robust under rotation/tilt)
     """
     k = kps.astype(np.float32)
     le, re, no, lm, rm = k
     eye_dist = float(np.linalg.norm(re - le))
     if eye_dist < float(min_eye_dist):
         return False
-    if not (lm[1] > no[1] and rm[1] > no[1]):
+    if not (le[1] < lm[1] and re[1] < rm[1]):
         return False
     return True
 
@@ -224,7 +225,7 @@ class HaarFaceMesh5pt:
             )
         self.mesh = mp.solutions.face_mesh.FaceMesh(
             static_image_mode=False,
-            max_num_faces=1,
+            max_num_faces=5,
             refine_landmarks=True,
             min_detection_confidence=0.5,
             min_tracking_confidence=0.5,
@@ -278,12 +279,56 @@ class HaarFaceMesh5pt:
         H, W = frame_bgr.shape[:2]
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         faces = self._haar_faces(gray)
+        
+        out: List[FaceDet] = []
+        
         if faces.shape[0] == 0:
-            return []
+            # Fallback: Run FaceMesh on the full frame directly if Haar fails
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            res = self.mesh.process(rgb)
+            if res.multi_face_landmarks:
+                for lm_obj in res.multi_face_landmarks[:max_faces]:
+                    lm = lm_obj.landmark
+                    idxs = [
+                        self.IDX_LEFT_EYE,
+                        self.IDX_RIGHT_EYE,
+                        self.IDX_NOSE_TIP,
+                        self.IDX_MOUTH_LEFT,
+                        self.IDX_MOUTH_RIGHT,
+                    ]
+                    pts = []
+                    for idx in idxs:
+                        p = lm[idx]
+                        pts.append([p.x * W, p.y * H])
+                    kps = np.array(pts, dtype=np.float32)
+                    
+                    if kps[0, 0] > kps[1, 0]:
+                        kps[[0, 1]] = kps[[1, 0]]
+                    if kps[3, 0] > kps[4, 0]:
+                        kps[[3, 4]] = kps[[4, 3]]
+                        
+                    if not _kps_span_ok(kps, min_eye_dist=10.0):
+                        continue
+                        
+                    bb = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
+                    x1, y1, x2, y2 = _clip_xyxy(bb[0], bb[1], bb[2], bb[3], W, H)
+                    
+                    out.append(
+                        FaceDet(
+                            x1=x1,
+                            y1=y1,
+                            x2=x2,
+                            y2=y2,
+                            score=1.0,
+                            kps=kps.astype(np.float32),
+                        )
+                    )
+            return out
+            
         areas = faces[:, 2] * faces[:, 3]
         order = np.argsort(areas)[::-1]
         faces = faces[order][:max_faces]
-        out: List[FaceDet] = []
+        
         for x, y, w, h in faces:
             mx, my = 0.25 * w, 0.35 * h
             rx1, ry1, rx2, ry2 = _clip_xyxy(
@@ -298,7 +343,7 @@ class HaarFaceMesh5pt:
             kps = kps_roi.copy()
             kps[:, 0] += float(rx1)
             kps[:, 1] += float(ry1)
-            if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.18 * float(w))):
+            if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.15 * float(w))):
                 if self.debug:
                     print("[recognize] 5pt geometry failed -> skip")
                 continue
@@ -374,7 +419,7 @@ def main():
     )
     db = load_db_npz(db_path)
     matcher = FaceDBMatcher(db=db, dist_thresh=0.62)
-    cap = cv2.VideoCapture(1)
+    cap = cv2.VideoCapture(config.CAMERA_INDEX)
     if not cap.isOpened():
         raise RuntimeError("Camera not available")
     print("Recognize (multi-face). q=quit, r=reload DB, +/- threshold, d=debug overlay")

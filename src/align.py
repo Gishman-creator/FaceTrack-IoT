@@ -25,6 +25,7 @@ import numpy as np
 
 # Import from your existing script
 from .haar_5pt import Haar5ptDetector, align_face_5pt
+from . import config
 
 
 def _put_text(img, text: str, xy=(10, 30), scale=0.8, thickness=2):
@@ -47,7 +48,7 @@ def _safe_imshow(win: str, img: np.ndarray):
 
 
 def main(
-    cam_index: int = 0,
+    cam_index: int = config.CAMERA_INDEX,
     out_size: Tuple[int, int] = (112, 112),
     mirror: bool = True,
 ):

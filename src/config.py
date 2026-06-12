@@ -6,7 +6,7 @@ HISTORY_DIR = Path("data/history")
 ARCFACE_MODEL_PATH = "models/embedder_arcface.onnx"
 
 # Camera
-CAMERA_INDEX = 0
+CAMERA_INDEX = 1
 
 # Detection & Locking
 HAAR_MIN_SIZE = (70, 70)

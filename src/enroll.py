@@ -31,6 +31,7 @@ import cv2
 import numpy as np
 from .haar_5pt import Haar5ptDetector, align_face_5pt
 from .embed import ArcFaceEmbedderONNX
+from . import config
 
 
 # -------------------------
@@ -45,6 +46,7 @@ class EnrollConfig:
     samples_needed: int = 15
     auto_capture_every_s: float = 0.25
     max_existing_crops: int = 300
+    camera_index: int = config.CAMERA_INDEX
     # UI
     window_main: str = "enroll"
     window_aligned: str = "aligned_112"
@@ -200,7 +202,7 @@ def main():
     auto = False
     last_auto = 0.0
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(cfg.camera_index)
     if not cap.isOpened():
         raise RuntimeError("Failed to open camera.")
 

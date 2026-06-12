@@ -74,13 +74,13 @@ def detect_actions(frame, mesh, prev_center_x, center_x, prev_ear, prev_mouth_wi
     if prev_center_x is not None:
         dx = center_x - prev_center_x
         if dx <= -config.LOCK_MOVEMENT_THRESHOLD_PX:
-            if frame_idx - last_action_frame.get("face_moved_left", -999) >= cooldown:
-                actions.append(("face_moved_left", "face moved left"))
-                last_action_frame["face_moved_left"] = frame_idx
-        elif dx >= config.LOCK_MOVEMENT_THRESHOLD_PX:
             if frame_idx - last_action_frame.get("face_moved_right", -999) >= cooldown:
                 actions.append(("face_moved_right", "face moved right"))
                 last_action_frame["face_moved_right"] = frame_idx
+        elif dx >= config.LOCK_MOVEMENT_THRESHOLD_PX:
+            if frame_idx - last_action_frame.get("face_moved_left", -999) >= cooldown:
+                actions.append(("face_moved_left", "face moved left"))
+                last_action_frame["face_moved_left"] = frame_idx
 
     landmarks_list = get_full_landmarks(frame, mesh)
     if landmarks_list is None:
@@ -118,17 +118,22 @@ def main():
     print("\nEnrolled identities:")
     for i, n in enumerate(names, 1):
         print(f"  {i}. {n}")
-    print("\nEnter the name of the identity to lock (exact match): ", end="")
+    print("\nEnter the name or number of the identity to lock: ", end="")
     try:
         choice = input().strip()
     except EOFError:
         choice = names[0] if names else ""
     if not choice:
         choice = names[0] if names else ""
-    if choice not in db:
+        
+    lock_identity = None
+    if choice.isdigit() and 1 <= int(choice) <= len(names):
+        lock_identity = names[int(choice)-1]
+    elif choice in db:
+        lock_identity = choice
+    else:
         print(f"ERROR: '{choice}' not in database. Choose from: {names}")
         return False
-    lock_identity = choice
     print("Will lock onto:", lock_identity)
 
     config.ensure_dirs()

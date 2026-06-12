@@ -65,7 +65,8 @@ def _kps_span_ok(kps: np.ndarray, min_eye_dist: float) -> bool:
     le, re, no, lm, rm = k
     eye_dist = float(np.linalg.norm(re - le))
     if eye_dist < float(min_eye_dist): return False
-    if not (lm[1] > no[1] and rm[1] > no[1]): return False
+    # Ensure eyes are above mouth corners (more robust under rotation/tilt)
+    if not (le[1] < lm[1] and re[1] < rm[1]): return False
     return True
 
 # ---------------------------------------------------------------------
@@ -114,7 +115,7 @@ class HaarFaceMesh5pt:
         if mp is None:
             raise RuntimeError("MediaPipe not found.")
         self.mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False, max_num_faces=1, refine_landmarks=True,
+            static_image_mode=False, max_num_faces=5, refine_landmarks=True,
             min_detection_confidence=0.5, min_tracking_confidence=0.5
         )
         self.idx_map = [33, 263, 1, 61, 291] # LeftEye, RightEye, Nose, LeftMouth, RightMouth
@@ -125,15 +126,37 @@ class HaarFaceMesh5pt:
         faces = self.face_cascade.detectMultiScale(
             gray, scaleFactor=1.1, minNeighbors=5, flags=cv2.CASCADE_SCALE_IMAGE, minSize=self.min_size
         )
-        if len(faces) == 0:
-            return []
         
+        out = []
+        
+        if len(faces) == 0:
+            # Fallback: Run FaceMesh on the full frame directly if Haar fails
+            roi_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = self.mesh.process(roi_rgb)
+            if res.multi_face_landmarks:
+                for lm_obj in res.multi_face_landmarks[:max_faces]:
+                    lm = lm_obj.landmark
+                    pts = []
+                    for i in self.idx_map:
+                        p = lm[i]
+                        pts.append([p.x * W, p.y * H])
+                    kps = np.array(pts, dtype=np.float32)
+                    
+                    if kps[0,0] > kps[1,0]: kps[[0,1]] = kps[[1,0]]
+                    if kps[3,0] > kps[4,0]: kps[[3,4]] = kps[[4,3]]
+                    
+                    if not _kps_span_ok(kps, min_eye_dist=10.0): continue
+                    
+                    bb = _bbox_from_5pt(kps)
+                    bx1, by1, bx2, by2 = _clip_xyxy(bb[0], bb[1], bb[2], bb[3], W, H)
+                    out.append(FaceDet(bx1, by1, bx2, by2, 1.0, kps))
+            return out
+            
         # Sort by area
         areas = faces[:, 2] * faces[:, 3]
         order = np.argsort(areas)[::-1]
         faces = faces[order][:max_faces]
         
-        out = []
         for x, y, w, h in faces:
             # Expand ROI for FaceMesh
             mx, my = 0.25*w, 0.35*h
@@ -157,7 +180,7 @@ class HaarFaceMesh5pt:
             if kps[0,0] > kps[1,0]: kps[[0,1]] = kps[[1,0]]
             if kps[3,0] > kps[4,0]: kps[[3,4]] = kps[[4,3]]
             
-            if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.18*w)): continue
+            if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.15*w)): continue
             
             # Re-box
             bb = _bbox_from_5pt(kps)
@@ -218,13 +241,13 @@ def detect_actions(frame, mesh, prev_center_x, center_x, prev_ear, prev_mouth, b
     if prev_center_x is not None:
         dx = center_x - prev_center_x
         if dx <= -config.LOCK_MOVEMENT_THRESHOLD_PX:
-            if frame_idx - last_actions.get("move_left", -999) > cooldown:
-                actions.append(("face_moved_left", "Left"))
-                last_actions["move_left"] = frame_idx
-        elif dx >= config.LOCK_MOVEMENT_THRESHOLD_PX:
             if frame_idx - last_actions.get("move_right", -999) > cooldown:
                 actions.append(("face_moved_right", "Right"))
                 last_actions["move_right"] = frame_idx
+        elif dx >= config.LOCK_MOVEMENT_THRESHOLD_PX:
+            if frame_idx - last_actions.get("move_left", -999) > cooldown:
+                actions.append(("face_moved_left", "Left"))
+                last_actions["move_left"] = frame_idx
                 
     # Blink
     ear = (_ear_from_landmarks(lms, config.LOCK_EAR_LEFT_INDICES, W, H) + 
@@ -264,12 +287,16 @@ def main():
     for i, n in enumerate(names, 1):
         print(f" {i}. {n}")
         
-    print("\nEnter name to LOCK onto (others will be recognized): ", end="")
-    target = input().strip()
-    if not target: target = names[0] if names else ""
-    if target not in db:
-        print(f"'{target}' not found. Defaulting to first." if names else "Error")
-        if names: target = names[0]
+    print("\nEnter name or number to LOCK onto (others will be recognized): ", end="")
+    choice = input().strip()
+    target = "Unknown"
+    if choice.isdigit() and 1 <= int(choice) <= len(names):
+        target = names[int(choice)-1]
+    elif choice in db:
+        target = choice
+    else:
+        print(f"'{choice}' not found. Defaulting to first: '{names[0]}'")
+        target = names[0]
         
     print(f"Locking onto: {target}")
     

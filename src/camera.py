@@ -1,9 +1,9 @@
-# src/camera.py
 import cv2
+from . import config
 
 
 def main():
-    cap = cv2.VideoCapture(2)
+    cap = cv2.VideoCapture(config.CAMERA_INDEX)
 
     if not cap.isOpened():
         raise RuntimeError("Camera not opened. Try changing index (0/1/2).")

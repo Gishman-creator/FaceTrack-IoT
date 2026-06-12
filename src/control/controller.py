@@ -13,6 +13,7 @@ import paho.mqtt.client as mqtt
 from flask import Flask, Response, send_from_directory
 from flask_socketio import SocketIO
 from pathlib import Path
+import csv
 
 # Fix path to allow importing from src (if run as script)
 if __name__ == "__main__" and __package__ is None:
@@ -34,32 +35,103 @@ MQTT_BROKER = "157.173.101.159"
 MQTT_PORT = 1883
 MQTT_TOPIC_MOVE = "y3d/team7/movement"
 MQTT_TOPIC_HEARTBEAT = "y3d/team7/heartbeat"
+MQTT_TOPIC_ACK = "y3d/team7/ack"
 MQTT_CLIENT_ID = "pc_vision_team7"
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Global State
-# Global State
 lock = threading.Lock()
 mqtt_client = None
+
+# Handshake & Rate-limiting State
+pending_ack = False
+last_sent_time = 0.0
+latest_pending_command = None
+mqtt_ack_lock = threading.Lock()
+
+# CSV Logging State & Lock
+csv_log_lock = threading.Lock()
+last_logged_command = None
+
+def log_to_csv(speaker, confidence, command):
+    global last_logged_command
+    with csv_log_lock:
+        # Prevent logging consecutive SEARCH commands
+        if command == "SEARCH" and last_logged_command == "SEARCH":
+            return
+            
+        last_logged_command = command
+        
+        csv_file_path = config.HISTORY_DIR / "tracking_log.csv"
+        config.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        
+        file_exists = csv_file_path.exists()
+        
+        try:
+            with open(csv_file_path, mode="a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(["timestamp", "speaker", "confidence", "motor_command"])
+                
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                conf_val = round(max(0.0, float(confidence)), 4) if isinstance(confidence, (int, float)) else confidence
+                writer.writerow([timestamp, speaker, conf_val, command])
+        except Exception as e:
+            print(f"Error logging to CSV: {e}")
+
+def on_mqtt_message(client, userdata, message):
+    global pending_ack, last_sent_time, latest_pending_command
+    try:
+        payload = message.payload.decode('utf-8')
+        if message.topic == MQTT_TOPIC_ACK:
+            if payload in ("ACK", "READY"):
+                with mqtt_ack_lock:
+                    pending_ack = False
+                    cmd_to_send = latest_pending_command
+                    latest_pending_command = None
+                if cmd_to_send is not None:
+                    # cmd_to_send is a tuple: (command, speaker, confidence)
+                    publish_move(cmd_to_send[0], cmd_to_send[1], cmd_to_send[2])
+    except Exception as e:
+        print(f"Error in MQTT callback: {e}")
 
 def setup_mqtt():
     global mqtt_client
     try:
         # Use VERSION2 to avoid deprecation warnings
         mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=MQTT_CLIENT_ID)
+        mqtt_client.on_message = on_mqtt_message
         mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        mqtt_client.subscribe(MQTT_TOPIC_ACK)
         mqtt_client.loop_start()
         print(f"Connected to MQTT Broker: {MQTT_BROKER}")
     except Exception as e:
         print(f"Failed to connect to MQTT Broker ({MQTT_BROKER}): {e}")
         print("-> Servo control will NOT work. Check your VPN or Broker IP.")
 
-def publish_move(command):
-    if mqtt_client:
-        mqtt_client.publish(MQTT_TOPIC_MOVE, command)
-        # print(f"Published: {command}")
+def publish_move(command, speaker="None", confidence=0.0):
+    global pending_ack, last_sent_time, latest_pending_command
+    if not mqtt_client:
+        return
+    
+    with mqtt_ack_lock:
+        now = time.time()
+        # Safety timeout: if no ACK for 2 seconds, reset state to avoid blocking
+        if pending_ack and (now - last_sent_time > 2.0):
+            pending_ack = False
+            # print("MQTT ACK Timeout, resetting state.")
+            
+        if pending_ack:
+            # Overwrite previous unsent command so we only send the latest state
+            latest_pending_command = (command, speaker, confidence)
+        else:
+            mqtt_client.publish(MQTT_TOPIC_MOVE, command)
+            pending_ack = True
+            last_sent_time = now
+            latest_pending_command = None
+            log_to_csv(speaker, confidence, command)
 
 def cv_loop(initial_target):
     
@@ -212,19 +284,19 @@ def cv_loop(initial_target):
             # Deadzone of 40px to avoid jitter when face is relatively centered
             if abs(err) > 40:
                 if now - last_servo_time > 0.05: # Max 20Hz update rate
-                    # Proportional step based on error distance
+                    # Proportional step based on error distance (divided by 60 for gentler movement)
                     # Inverted step calculation so it moves towards the face
                     # depending on the servo mounting orientation.
-                    step = int(-err / 25)
+                    step = int(-err / 60)
                     
                     # Ensure minimal movement happens if outside deadzone
                     if step == 0:
                         step = 1 if -err > 0 else -1
                         
-                    # Constrain max step size per update to prevent sudden jerking
-                    step = max(-10, min(10, step))
+                    # Constrain max step size to 3 degrees per update to prevent sudden jerking
+                    step = max(-3, min(3, step))
                     
-                    publish_move(f"STEP:{step}")
+                    publish_move(f"STEP:{step}", speaker=target_identity, confidence=1.0 - min_dist)
                     last_servo_time = now
                     action_status = f"Centering ({step} deg)"
             else:
@@ -248,10 +320,11 @@ def cv_loop(initial_target):
             socketio.emit('status_update', {'locked': True, 'target': target_identity, 'action': action_status})
         else:
              if now - last_servo_time > 0.05:
-                 publish_move("SEARCH")
+                 publish_move("SEARCH", speaker="None", confidence=0.0)
                  last_servo_time = now
              action_status = "Searching"
              socketio.emit('status_update', {'locked': False, 'target': target_identity, 'action': action_status})
+             cv2.putText(vis, f"Searching for {target_identity}...", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         # Update Video Stream
         # ret, buffer = cv2.imencode('.jpg', vis)
