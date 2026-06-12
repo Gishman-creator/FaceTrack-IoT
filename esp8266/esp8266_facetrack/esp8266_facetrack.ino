@@ -1,26 +1,33 @@
-#include <ESP8266WiFi.h>
+// Face-Locked Servo Controller
+// Board: ESP8266 (NodeMCU, Wemos D1 mini, ...)
+
+#include <ESP8266WiFi.h>    
 #include <PubSubClient.h>
-#include <Servo.h>
+#include <Servo.h>          
 
 // --- Configuration ---
-const char* ssid = "Main Hall";
-const char* password = "Meeting@2024";
+const char* ssid = "Peace And Love Ploclaimers"; 
+const char* password = "loveisthekey";
 const char* mqtt_server = "157.173.101.159"; 
 
 const int mqtt_port = 1883;
 const int scan_step_angle = 20;        // Angle to step during scanning
 const int scan_pause_ms = 1000;        // Time to pause at each step (milliseconds)
-const char* client_id = "esp8266_team7_client";
+
+// Unique client ID buffer to prevent public broker collisions
+char client_id[40]; 
+
 const char* topic_movement = "y3d/team7/movement";
 const char* topic_heartbeat = "y3d/team7/heartbeat";
 const char* topic_ack = "y3d/team7/ack";
 
 // Servo Configuration
 Servo myServo;
-const int servoPin = 14; // GPIO14 is D5 on NodeMCU
+// Pin 5 maps to D1 on most NodeMCU/Wemos D1 Mini boards
+const int servoPin = 5; 
 int targetAngle = 90;
 int actualAngle = 90;
-const int moveStep = 10; // Step size reduced for smoother movement
+const int moveStep = 10; 
 int searchDirection = 1; // Used to track direction during continuous search
 
 WiFiClient espClient;
@@ -28,23 +35,85 @@ PubSubClient client(espClient);
 
 // --- Functions ---
 
+// Helper function to scan and print nearby networks safely on ESP8266
+void scanAndPrintNetworks() {
+  Serial.println("\n--- Scanning for available Wi-Fi networks... ---");
+  
+  // false, false handles blocking scan and skips hidden SSIDs for memory safety
+  int n = WiFi.scanNetworks(false, false); 
+  
+  if (n == 0) {
+    Serial.println("[!] No networks found. Check power supply or 2.4GHz availability.");
+  } else {
+    Serial.print("[!] "); Serial.print(n); Serial.println(" networks found:");
+    for (int i = 0; i < n; ++i) {
+      Serial.print("  -> ");
+      Serial.print(i + 1);
+      Serial.print(": ");
+      Serial.print(WiFi.SSID(i));
+      Serial.print(" (");
+      Serial.print(WiFi.RSSI(i));
+      Serial.println("dBm)");
+      yield(); // Feeds the ESP8266 hardware watchdog to prevent reset crashes
+    }
+  }
+  
+  WiFi.scanDelete(); // Free memory resources allocated for the scan
+  Serial.println("-----------------------------------------------\n");
+}
+
 void setup_wifi() {
   delay(10);
   Serial.println();
   Serial.print("Connecting to ");
   Serial.println(ssid);
 
+  WiFi.persistent(false); // Protects internal flash memory from wear
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  
+  // CRITICAL FIX: Drops RF power output slightly to prevent USB brownouts during transmission
+  WiFi.setOutputPower(15); 
+  Serial.println("[INFO] RF Output Power capped at 15dBm to control power spikes.");
+
   WiFi.begin(ssid, password);
 
-  // Wait until WiFi is officially connected
+  unsigned long startAttemptTime = millis();
+  unsigned long lastLogTime = 0;
+  int secondsCounter = 0;
+
+  // Loop non-blockingly for initial connection setup
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+    unsigned long currentMillis = millis();
+
+    // Log the failure message exactly every 1 second (1000ms)
+    if (currentMillis - lastLogTime >= 1000) {
+      lastLogTime = currentMillis;
+      secondsCounter++;
+      Serial.print("["); Serial.print(secondsCounter); Serial.print("s] ");
+      Serial.println("Couldn't connect to WiFi...");
+    }
+
+    // Every 10 seconds, print available Wi-Fi options and force a retry
+    if (currentMillis - startAttemptTime >= 10000) {
+      Serial.println("\n[!] 10 seconds reached without connection.");
+      
+      // Run the network diagnostic scan
+      scanAndPrintNetworks();
+      
+      Serial.print("Retrying connection to: "); Serial.println(ssid);
+      WiFi.disconnect(); 
+      WiFi.begin(ssid, password);
+      
+      startAttemptTime = currentMillis; // Reset the 10-second anchor
+      secondsCounter = 0;               // Reset visual log counter
+    }
+    
+    yield(); // Keeps background system processes alive
   }
 
   Serial.println("");
-  Serial.println("WiFi connected");
+  Serial.println("WiFi connected successfully!");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 }
@@ -102,32 +171,34 @@ void callback(char* topic, byte* payload, unsigned int length) {
 }
 
 void reconnect() {
-  // Only attempt MQTT if WiFi is up
   if (WiFi.status() != WL_CONNECTED) return;
 
-  Serial.print("Attempting MQTT connection...");
+  Serial.print("Attempting MQTT connection to Custom Broker... ");
   if (client.connect(client_id)) {
     Serial.println("connected");
     client.subscribe(topic_movement);
-    // Notify controller that we are ready
     client.publish(topic_ack, "READY");
   } else {
     Serial.print("failed, rc=");
     Serial.print(client.state());
     Serial.println(" try again in 5 seconds");
-    // No long delay here to keep loop() responsive
   }
 }
 
 void setup() {
-  // Use 115200 to match your ESP8266's default speed
   Serial.begin(115200);
+  delay(500); 
   
-  // Initialize hardware
-  myServo.attach(servoPin);
+  // Dynamic generation of unique Client ID using ESP8266 hardware chip ID
+  snprintf(client_id, sizeof(client_id), "esp8266_team7_%06X", ESP.getChipId());
+  Serial.print("Generated Client ID: ");
+  Serial.println(client_id);
+  
+  // Initialize hardware servo
+  myServo.attach(servoPin); 
   myServo.write(actualAngle); 
 
-  // 1. Establish WiFi first
+  // 1. Establish WiFi first (Runs setOutputPower inside)
   setup_wifi();
   
   // 2. Setup MQTT parameters
@@ -139,10 +210,19 @@ void loop() {
   // 1. Always keep the MQTT client processing
   client.loop(); 
 
-  // 2. Handle WiFi Reconnection
+  // 2. Handle WiFi Reconnection if it drops mid-operation
   if (WiFi.status() != WL_CONNECTED) {
     static unsigned long lastWifiRetry = 0;
-    if (millis() - lastWifiRetry > 5000) {
+    static unsigned long lastWifiLog = 0;
+
+    if (millis() - lastWifiLog > 1000) {
+      Serial.println("WiFi connection lost. Awaiting reconnect...");
+      lastWifiLog = millis();
+    }
+
+    if (millis() - lastWifiRetry > 10000) { 
+      Serial.println("Retrying WiFi background hook...");
+      scanAndPrintNetworks(); 
       WiFi.begin(ssid, password);
       lastWifiRetry = millis();
     }
@@ -169,7 +249,7 @@ void loop() {
 
   // 5. Smooth Servo Easing Logic
   static unsigned long lastServoUpdate = 0;
-  const unsigned long servoSpeedDelay = 15; // Milliseconds per degree step (lower is faster/less smooth, higher is slower/smoother)
+  const unsigned long servoSpeedDelay = 15; 
   if (millis() - lastServoUpdate >= servoSpeedDelay) {
     if (actualAngle < targetAngle) {
       actualAngle++;
@@ -181,7 +261,7 @@ void loop() {
     lastServoUpdate = millis();
   }
 
-  // 6. Serial Input Command Processing (e.g. type 'center' to recenter servo)
+  // 6. Serial Input Command Processing
   while (Serial.available() > 0) {
     char c = Serial.read();
     static String inputBuffer = "";
