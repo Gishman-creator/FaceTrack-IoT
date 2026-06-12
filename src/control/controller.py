@@ -58,11 +58,25 @@ last_logged_command = None
 def log_to_csv(speaker, confidence, command):
     global last_logged_command
     with csv_log_lock:
+        # Map command name for logging readability
+        log_command = command
+        if command.startswith("STEP:"):
+            try:
+                step_val = int(command.split(":")[1])
+                if step_val > 0:
+                    log_command = "MOVE_LEFT"
+                elif step_val < 0:
+                    log_command = "MOVE_RIGHT"
+                else:
+                    log_command = "IDLE"
+            except Exception:
+                pass
+
         # Prevent logging consecutive SEARCH commands
-        if command == "SEARCH" and last_logged_command == "SEARCH":
+        if log_command == "SEARCH" and last_logged_command == "SEARCH":
             return
             
-        last_logged_command = command
+        last_logged_command = log_command
         
         csv_file_path = config.HISTORY_DIR / "tracking_log.csv"
         config.HISTORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -77,7 +91,7 @@ def log_to_csv(speaker, confidence, command):
                 
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
                 conf_val = round(max(0.0, float(confidence)), 4) if isinstance(confidence, (int, float)) else confidence
-                writer.writerow([timestamp, speaker, conf_val, command])
+                writer.writerow([timestamp, speaker, conf_val, log_command])
         except Exception as e:
             print(f"Error logging to CSV: {e}")
 
@@ -173,6 +187,7 @@ def cv_loop(initial_target):
     frames = 0
     fps = 0.0
     last_servo_time = 0.0
+    last_target_seen_time = time.time()
 
     while True:
         ret, frame = cap.read()
@@ -276,6 +291,7 @@ def cv_loop(initial_target):
         
         if best_match:
             is_locked = True
+            last_target_seen_time = now
             face = best_match
             cx = (face.x1 + face.x2) / 2
             
@@ -319,12 +335,18 @@ def cv_loop(initial_target):
             prev_cx = cx
             socketio.emit('status_update', {'locked': True, 'target': target_identity, 'action': action_status})
         else:
-             if now - last_servo_time > 0.05:
-                 publish_move("SEARCH", speaker="None", confidence=0.0)
-                 last_servo_time = now
-             action_status = "Searching"
-             socketio.emit('status_update', {'locked': False, 'target': target_identity, 'action': action_status})
-             cv2.putText(vis, f"Searching for {target_identity}...", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+             time_since_seen = now - last_target_seen_time
+             if time_since_seen > 1.5:
+                 if now - last_servo_time > 0.05:
+                     publish_move("SEARCH", speaker="None", confidence=0.0)
+                     last_servo_time = now
+                 action_status = "Searching"
+                 socketio.emit('status_update', {'locked': False, 'target': target_identity, 'action': action_status})
+                 cv2.putText(vis, f"Searching for {target_identity}...", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+             else:
+                 action_status = "Awaiting Target"
+                 socketio.emit('status_update', {'locked': False, 'target': target_identity, 'action': action_status})
+                 cv2.putText(vis, f"Target lost, waiting {max(0.0, 1.5 - time_since_seen):.1f}s...", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
         # Update Video Stream
         # ret, buffer = cv2.imencode('.jpg', vis)
